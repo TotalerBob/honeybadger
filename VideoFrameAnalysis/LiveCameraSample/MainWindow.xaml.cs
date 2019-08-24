@@ -1,0 +1,290 @@
+﻿// 
+// Copyright (c) Microsoft. All rights reserved.
+// Licensed under the MIT license.
+// 
+// Microsoft Cognitive Services: http://www.microsoft.com/cognitive
+// 
+// Microsoft Cognitive Services Github:
+// https://github.com/Microsoft/Cognitive
+// 
+// Copyright (c) Microsoft Corporation
+// All rights reserved.
+// 
+// MIT License:
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+// 
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED ""AS IS"", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// 
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media.Imaging;
+using System.Windows.Navigation;
+using Microsoft.Azure.CognitiveServices.Vision.ComputerVision;
+using Newtonsoft.Json.Linq;
+using OpenCvSharp;
+using OpenCvSharp.Extensions;
+using VideoFrameAnalyzer;
+using FaceAPI = Microsoft.Azure.CognitiveServices.Vision.Face;
+using VisionAPI = Microsoft.Azure.CognitiveServices.Vision.ComputerVision;
+
+namespace LiveCameraSample
+{
+    /// <summary>
+    /// Interaction logic for MainWindow.xaml
+    /// </summary>
+    public partial class MainWindow : System.Windows.Window, IDisposable
+    {
+        private VisionAPI.ComputerVisionClient _visionClient = null;
+        private readonly FrameGrabber<LiveCameraResult> _grabber;
+        private static readonly ImageEncodingParam[] s_jpegParams = {
+            new ImageEncodingParam(ImwriteFlags.JpegQuality, 60)
+        };
+        private readonly CascadeClassifier _localFaceDetector = new CascadeClassifier();
+        private bool _fuseClientRemoteResults;
+        private LiveCameraResult _latestResultsToDisplay = null;
+        private DateTime _startTime;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+
+            // Create grabber. 
+            _grabber = new FrameGrabber<LiveCameraResult>();
+
+            // Set up a listener for when the client receives a new frame.
+            _grabber.NewFrameProvided += (s, e) =>
+            {
+                /*
+                if (_mode == AppMode.EmotionsWithClientFaceDetect)
+                {
+                    // Local face detection. 
+                    var rects = _localFaceDetector.DetectMultiScale(e.Frame.Image);
+                    // Attach faces to frame. 
+                    e.Frame.UserData = rects;
+                }
+                */
+                // The callback may occur on a different thread, so we must use the
+                // MainWindow.Dispatcher when manipulating the UI. 
+                this.Dispatcher.BeginInvoke((Action)(() =>
+                {
+                    // Display the image in the left pane.
+                    LeftImage.Source = e.Frame.Image.ToBitmapSource();
+
+                    // If we're fusing client-side face detection with remote analysis, show the
+                    // new frame now with the most recent analysis available. 
+                    if (_fuseClientRemoteResults)
+                    {
+                        //RightImage.Source = VisualizeResult(e.Frame);
+                    }
+                }));
+
+                // See if auto-stop should be triggered. 
+                if (Properties.Settings.Default.AutoStopEnabled && (DateTime.Now - _startTime) > Properties.Settings.Default.AutoStopTime)
+                {
+                    _grabber.StopProcessingAsync().GetAwaiter().GetResult();
+                }
+            };
+
+            // Set up a listener for when the client receives a new result from an API call. 
+            _grabber.NewResultAvailable += (s, e) =>
+            {
+                this.Dispatcher.BeginInvoke((Action)(() =>
+                {
+                    if (e.TimedOut)
+                    {
+                        MessageArea.Text = "API call timed out.";
+                    }
+                    else if (e.Exception != null)
+                    {
+                        string apiName = "";
+                        string message = e.Exception.Message;
+                        var faceEx = e.Exception as FaceAPI.Models.APIErrorException;
+                        var visionEx = e.Exception as VisionAPI.Models.ComputerVisionErrorException;
+                        if (faceEx != null)
+                        {
+                            apiName = "Face";
+                            message = faceEx.Message;
+                        }
+                        else if (visionEx != null)
+                        {
+                            apiName = "Computer Vision";
+                            message = visionEx.Message;
+                        }
+                        MessageArea.Text = string.Format("{0} API call failed on frame {1}. Exception: {2}", apiName, e.Frame.Metadata.Index, message);
+                    }
+                    else
+                    {
+                        _latestResultsToDisplay = e.Analysis;
+
+                        // Display the image and visualization in the right pane. 
+                        if (!_fuseClientRemoteResults)
+                        {
+                            //RightImage.Source = VisualizeResult(e.Frame);
+                        }
+                    }
+                }));
+            };
+        }
+
+        /// <summary> Function which submits a frame to the Computer Vision API for tagging. </summary>
+        /// <param name="frame"> The video frame to submit. </param>
+        /// <returns> A <see cref="Task{LiveCameraResult}"/> representing the asynchronous API call,
+        ///     and containing the tags returned by the API. </returns>
+        private async Task<LiveCameraResult> TaggingAnalysisFunction(VideoFrame frame)
+        {
+            // Encode image. 
+            var jpg = frame.Image.ToMemoryStream(".jpg", s_jpegParams);
+            Rest.MakeOCRRequest(jpg.ToArray());
+
+            // Submit image to API. 
+            var tagResult = await _visionClient.TagImageInStreamAsync(jpg);
+            // Count the API call. 
+            Properties.Settings.Default.VisionAPICallCount++;
+
+            
+
+            // Output. 
+            return new LiveCameraResult { Tags = tagResult.Tags.ToArray() };
+        }
+
+        /// <summary> Populate CameraList in the UI, once it is loaded. </summary>
+        /// <param name="sender"> Source of the event. </param>
+        /// <param name="e">      Routed event information. </param>
+        private void CameraList_Loaded(object sender, RoutedEventArgs e)
+        {
+            int numCameras = _grabber.GetNumCameras();
+
+            if (numCameras == 0)
+            {
+                MessageArea.Text = "No cameras found!";
+            }
+
+            var comboBox = sender as ComboBox;
+            comboBox.ItemsSource = Enumerable.Range(0, numCameras).Select(i => string.Format("Camera {0}", i + 1));
+            comboBox.SelectedIndex = 0;
+        }
+        private async void StartButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!CameraList.HasItems)
+            {
+                MessageArea.Text = "No cameras found; cannot start processing";
+                return;
+            }
+            /*
+            // Clean leading/trailing spaces in API keys. 
+            Properties.Settings.Default.FaceAPIKey = Properties.Settings.Default.FaceAPIKey.Trim();
+            Properties.Settings.Default.VisionAPIKey = Properties.Settings.Default.VisionAPIKey.Trim();
+            */
+            _grabber.AnalysisFunction = TaggingAnalysisFunction;
+            // Create API clients.
+            _visionClient = new VisionAPI.ComputerVisionClient(new VisionAPI.ApiKeyServiceClientCredentials(Properties.Settings.Default.VisionAPIKey))
+            {
+                Endpoint = Properties.Settings.Default.VisionAPIHost
+            };
+
+            // How often to analyze. 
+            _grabber.TriggerAnalysisOnInterval(Properties.Settings.Default.AnalysisInterval);
+
+            // Reset message. 
+            MessageArea.Text = "";
+
+            // Record start time, for auto-stop
+            _startTime = DateTime.Now;
+
+            await _grabber.StartProcessingCameraAsync(CameraList.SelectedIndex);
+        }
+
+        private async void StopButton_Click(object sender, RoutedEventArgs e)
+        {
+            await _grabber.StopProcessingAsync();
+        }
+
+        private void Hyperlink_RequestNavigate(object sender, RequestNavigateEventArgs e)
+        {
+            Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri));
+            e.Handled = true;
+        }
+
+        private FaceAPI.Models.DetectedFace CreateFace(VisionAPI.Models.FaceRectangle rect)
+        {
+            return new FaceAPI.Models.DetectedFace
+            {
+                FaceRectangle = new FaceAPI.Models.FaceRectangle
+                {
+                    Left = rect.Left,
+                    Top = rect.Top,
+                    Width = rect.Width,
+                    Height = rect.Height
+                }
+            };
+        }
+
+        private void MatchAndReplaceFaceRectangles(FaceAPI.Models.DetectedFace[] faces, OpenCvSharp.Rect[] clientRects)
+        {
+            // Use a simple heuristic for matching the client-side faces to the faces in the
+            // results. Just sort both lists left-to-right, and assume a 1:1 correspondence. 
+
+            // Sort the faces left-to-right. 
+            var sortedResultFaces = faces
+                .OrderBy(f => f.FaceRectangle.Left + 0.5 * f.FaceRectangle.Width)
+                .ToArray();
+
+            // Sort the clientRects left-to-right.
+            var sortedClientRects = clientRects
+                .OrderBy(r => r.Left + 0.5 * r.Width)
+                .ToArray();
+
+            // Assume that the sorted lists now corrrespond directly. We can simply update the
+            // FaceRectangles in sortedResultFaces, because they refer to the same underlying
+            // objects as the input "faces" array. 
+            for (int i = 0; i < Math.Min(faces.Length, clientRects.Length); i++)
+            {
+                // convert from OpenCvSharp rectangles
+                OpenCvSharp.Rect r = sortedClientRects[i];
+                sortedResultFaces[i].FaceRectangle = new FaceAPI.Models.FaceRectangle { Left = r.Left, Top = r.Top, Width = r.Width, Height = r.Height };
+            }
+        }
+
+        private bool disposedValue = false; // To detect redundant calls
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!disposedValue)
+            {
+                if (disposing)
+                {
+                    _grabber?.Dispose();
+                    _visionClient?.Dispose();
+                }
+
+                disposedValue = true;
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+    }
+}
